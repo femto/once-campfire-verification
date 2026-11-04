@@ -29,7 +29,7 @@ OptionParser.new do |parser|
 end.parse!
 raise "use at least two rounds" unless options[:rounds] >= 2
 apps = options[:apps].split(",")
-allowed = %w[rails django laravel express express-bun elixir go rust c cpp]
+allowed = %w[rails django laravel express express-bun elixir go rust c cpp egg egg-cache]
 raise "apps must be nonempty, unique and supported" unless !apps.empty? && apps.uniq == apps && apps.all? { |app| allowed.include?(app) }
 selected_routes = options[:routes].split(",")
 raise "unknown or empty route selection" unless !selected_routes.empty? && (selected_routes - %w[room_show messages_page sidebar search avatar static_css up post_message]).empty?
@@ -40,7 +40,9 @@ if mixed
   selected_routes &= %w[room_show messages_page sidebar search]
   raise "mixed profile requires a read route" if selected_routes.empty?
 end
-runtimes = apps.to_h { |app| [app, app == "express-bun" ? "express" : app] }
+# Variants run another runtime's image with other settings.
+variants = { "express-bun" => "express", "egg-cache" => "egg" }
+runtimes = apps.to_h { |app| [app, variants.fetch(app, app)] }
 env_name = ->(app) { app.upcase.tr("-", "_") }
 labels = JSON.parse(File.read(File.join(options[:seed], "labels.json")))
 original_seed_sha = Digest::SHA256.file(File.join(options[:seed], "db/production.sqlite3")).hexdigest
@@ -89,7 +91,8 @@ begin
     order = iteration.even? ? apps : apps.reverse
     order.each do |app|
       kind = runtimes.fetch(app)
-      images = { "rails" => "once-campfire:app", "rust" => "campfire-rust:app", "elixir" => "campfire-elixir:app", "express-bun" => "once-campfire-express:bun" }
+      images = { "rails" => "once-campfire:app", "rust" => "campfire-rust:app", "elixir" => "campfire-elixir:app", "express-bun" => "once-campfire-express:bun",
+        "egg" => "once-campfire-egg:app", "egg-cache" => "once-campfire-egg:app" }
       image = ENV.fetch("#{env_name.(app)}_IMAGE", images.fetch(app, "once-campfire-#{app}:app"))
       source = File.join(options[:workspace], kind == "rails" ? "once-campfire" : "once-campfire-#{kind}")
       image_id = run("docker", "image", "inspect", "-f", "{{.Id}}", image).strip
@@ -111,6 +114,8 @@ begin
       initial_messages = sql.call(db, "SELECT COUNT(*) AS n FROM messages WHERE room_id=#{write_room}").first.fetch("n")
       config = fixture_env.merge("WEB_CONCURRENCY" => "3", "JOB_CONCURRENCY" => "3", "RAILS_MAX_THREADS" => "5",
         "RAILS_LOG_LEVEL" => "warn", "HTTP_PORT" => options[:port].to_s, "TARGET_PORT" => (options[:port] + 1).to_s)
+      # The same Egg image, keeping whole responses per worker.
+      config["CAMPFIRE_CACHE"] = "1" if app == "egg-cache"
       config.merge!(JSON.parse(ENV.fetch("#{env_name.(app)}_BENCH_ENV", "{}")))
       # Host-network comparisons may coexist with a release verification node.
       config["RELEASE_NODE"] = container if kind == "elixir"
@@ -126,9 +131,10 @@ begin
       when "laravel" then {http: "FrankenPHP/Octane", jobs: "leased auxiliary SQLite", cable: "native ReactPHP"}
       when "c" then {processes: 1, http_loops: config.fetch("CF_LOOPS", "affinity, capped at 4"), cache_bytes: config.fetch("CF_CACHE_BYTES", "67108864"), jobs: "in-process"}
       when "cpp" then {processes: 1, page_cache_mb: config.fetch("CAMPFIRE_PAGE_CACHE_MB", "32"), cable: "native", jobs: "in-process"}
+      when "egg" then {processes: 1, http_workers: config.fetch("CAMPFIRE_WORKERS", "32"), response_cache: config["CAMPFIRE_CACHE"] == "1" ? "per worker" : "off", cable: "none", jobs: "none"}
       when "django" then {http_workers: config.fetch("WEB_WORKERS", config["REDIS_URL"].to_s.empty? ? "1" : "affinity, capped at 4"), runtime: "ASGI/Uvicorn", cable: "native", jobs: "leased auxiliary SQLite"}
       end
-      unless %w[c cpp].include?(kind)
+      unless %w[c cpp egg].include?(kind)
         metadata[:topology][app][:response_cache_mb] = config.fetch("CAMPFIRE_RESPONSE_CACHE_MB", "64")
       end
       command = ["docker", "run", "-d", "--name", container, "--network", "host", "--cpuset-cpus", options[:cpus]]
